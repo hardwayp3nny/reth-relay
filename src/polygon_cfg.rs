@@ -4,7 +4,7 @@ use reth_ethereum::chainspec::{ChainSpec, Head};
 
 use std::sync::Arc;
 
-const SHANGHAI_BLOCK: u64 = 50523000;
+const SHANGHAI_BLOCK: u64 = 73440256;
 
 pub(crate) fn polygon_chain_spec() -> Arc<ChainSpec> {
     let genesis: Genesis =

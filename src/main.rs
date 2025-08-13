@@ -12,7 +12,7 @@
 
 #![warn(unused_crate_dependencies)]
 
-use polygon_cfg::{boot_nodes, head, polygon_chain_spec};
+use chain_cfg::{boot_nodes, head, polygon_chain_spec};
 use reth_discv4::Discv4ConfigBuilder;
 use reth_ethereum::network::{
     api::events::SessionInfo, config::NetworkMode, NetworkConfig, NetworkEvent,
@@ -22,24 +22,19 @@ use reth_tracing::{
     tracing::info, tracing_subscriber::filter::LevelFilter, LayerInfo, LogFormat, RethTracer,
     Tracer,
 };
-use rand::{rngs::OsRng, RngCore};
-use secp256k1::SecretKey;
+use secp256k1::{rand, SecretKey};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
 };
 use tokio_stream::StreamExt;
 
-pub mod polygon_cfg;
+pub mod chain_cfg;
 
 #[tokio::main]
 async fn main() {
     // The ECDSA private key used to create our enode identifier.
-    let mut rng = OsRng;
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let secret_key = SecretKey::from_slice(&secret_key_bytes)
-        .expect("generated 32-byte secret key");
+    let secret_key = SecretKey::new(&mut rand::thread_rng());
 
     let _ = RethTracer::new()
         .with_stdout(LayerInfo::new(
