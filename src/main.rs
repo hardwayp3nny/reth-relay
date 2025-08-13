@@ -36,7 +36,13 @@ async fn main() {
     let boot_nodes = polygon_cfg::boot_nodes();
     info!(count = boot_nodes.len(), "Adding bootnodes");
     for (i, n) in boot_nodes.iter().enumerate() { debug!(index = i, ?n, "bootnode"); }
-    discv4_cfg.add_boot_nodes(boot_nodes).lookup_interval(interval);
+    // Add fork id pair to improve compatibility in discv4 (EIP-868)
+    use reth_chainspec::{ForkHash, ForkId};
+    let fork_id = polygon_cfg::polygon_chain_spec().fork_id(&polygon_cfg::head());
+    discv4_cfg
+        .add_boot_nodes(boot_nodes)
+        .lookup_interval(interval)
+        .add_eip868_pair("eth", fork_id);
     let net_cfg = net_cfg.set_discovery_v4(discv4_cfg.build());
 
     let net_manager = NetworkManager::eth(net_cfg).await.unwrap();

@@ -16,6 +16,7 @@ rand = "0.8"
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", features = ["network"] }
 reth-discv4 = { git = "https://github.com/paradigmxyz/reth", features = ["test-utils"] }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth" }
 
 alloy-genesis = "1.0.24"
 secp256k1 = { version = "0.30", default-features = true }

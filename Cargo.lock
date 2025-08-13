@@ -4218,6 +4218,7 @@ dependencies = [
  "alloy-genesis",
  "anyhow",
  "rand 0.8.5",
+ "reth-chainspec",
  "reth-discv4",
  "reth-ethereum",
  "reth-tracing",
