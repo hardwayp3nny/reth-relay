@@ -1,4 +1,4 @@
-use reth_discv4::Discv4ConfigBuilder;
+use reth_discv4::{Discv4ConfigBuilder, NatResolver};
 use reth_ethereum::network::{
     api::events::SessionInfo, config::NetworkMode, NetworkConfig, NetworkEvent,
     NetworkEventListenerProvider, NetworkManager,
@@ -6,7 +6,7 @@ use reth_ethereum::network::{
 use reth_tracing::{tracing::{info, debug}, tracing_subscriber::filter::LevelFilter, LayerInfo, LogFormat, RethTracer, Tracer};
 use secp256k1::SecretKey;
 use rand::RngCore;
-use std::{net::{Ipv4Addr, SocketAddr}, time::Duration};
+use std::{env, net::{IpAddr, Ipv4Addr, SocketAddr}, time::Duration};
 use tokio_stream::StreamExt;
 
 mod polygon_cfg;
@@ -25,10 +25,16 @@ async fn main() {
     };
     let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 30303);
 
+    // Allow manual external IP via EXT_IP env to bypass blocked public IP APIs
+    let ext_ip = env::var("EXT_IP").ok().and_then(|s| s.parse::<IpAddr>().ok());
+    let nat = ext_ip.map(NatResolver::ExternalIp).unwrap_or(NatResolver::PublicIp);
+
     let net_cfg = NetworkConfig::builder(secret_key)
         .set_head(polygon_cfg::head())
         .network_mode(NetworkMode::Work)
         .listener_addr(local_addr)
+        // NAT hint; if EXT_IP provided, force that, else try public IP services
+        .add_nat(Some(nat))
         .build_with_noop_provider(polygon_cfg::polygon_chain_spec());
 
     let mut discv4_cfg = Discv4ConfigBuilder::default();
@@ -42,6 +48,8 @@ async fn main() {
     discv4_cfg
         .add_boot_nodes(boot_nodes)
         .lookup_interval(interval)
+        .external_ip_resolver(Some(nat))
+        .resolve_external_ip_interval(Some(Duration::from_secs(60)))
         .add_eip868_pair("eth", fork_id);
     let net_cfg = net_cfg.set_discovery_v4(discv4_cfg.build());
 

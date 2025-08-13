@@ -1,15 +1,46 @@
-use alloy_genesis::Genesis;
 use reth_discv4::NodeRecord;
-use reth_ethereum::chainspec::{ChainSpec, Head};
+use alloy_primitives::{b256, B256};
+use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuilder, Head};
+use reth_ethereum_forks::{EthereumHardfork, ForkCondition};
+use reth_primitives_traits::SealedHeader;
 use std::sync::Arc;
 
 const SHANGHAI_BLOCK: u64 = 50523000;
+const POLYGON_CHAIN_ID: u64 = 137;
+const POLYGON_GENESIS_HASH: B256 = b256!("a9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b");
 
 pub(crate) fn polygon_chain_spec() -> Arc<ChainSpec> {
-    // Load Polygon mainnet genesis (Bor) and build a full ChainSpec for accurate ForkId
-    let genesis: Genesis = serde_json::from_str(include_str!("./polygon_genesis.json"))
-        .expect("deserialize polygon genesis");
-    Arc::new(genesis.into())
+    // Build ChainSpec like the article: explicit genesis hash + hardfork schedule + base fee params
+    // Use default header shape but override hash explicitly
+    let sealed = SealedHeader::new(Default::default(), POLYGON_GENESIS_HASH);
+
+    let mut builder = ChainSpecBuilder::default();
+    builder = builder
+        .chain(POLYGON_CHAIN_ID.into())
+        .genesis(Default::default());
+
+    // Configure Polygon-like hardforks (approximate; should mirror Bor mainnet schedule)
+    builder = builder
+        .with_fork(EthereumHardfork::Frontier, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::Homestead, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::Tangerine, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::SpuriousDragon, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::Byzantium, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::Constantinople, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::Petersburg, ForkCondition::Block(0))
+        .with_fork(EthereumHardfork::Istanbul, ForkCondition::Block(3395000))
+        .with_fork(EthereumHardfork::MuirGlacier, ForkCondition::Block(3395000))
+        .with_fork(EthereumHardfork::Berlin, ForkCondition::Block(14750000))
+        .with_fork(EthereumHardfork::London, ForkCondition::Block(23850000))
+        // Post-merge forks (timestamps/TTD not used on Polygon Bor; set as never unless known)
+        ;
+
+    let mut spec = builder.build();
+    // Override genesis header hash without recomputing trie
+    spec.genesis_header = sealed;
+    spec.base_fee_params = BaseFeeParamsKind::Constant(BaseFeeParams::new(70, 60));
+
+    Arc::new(spec)
 }
 
 /// Polygon mainnet boot nodes
