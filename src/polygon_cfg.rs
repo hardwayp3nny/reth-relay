@@ -4,6 +4,7 @@ use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuild
 use reth_ethereum_forks::{EthereumHardfork, ForkCondition};
 use reth_primitives_traits::SealedHeader;
 use std::sync::Arc;
+use std::env;
 
 const SHANGHAI_BLOCK: u64 = 50523000;
 const POLYGON_CHAIN_ID: u64 = 137;
@@ -17,28 +18,22 @@ pub(crate) fn polygon_chain_spec() -> Arc<ChainSpec> {
     let mut builder = ChainSpecBuilder::default();
     builder = builder
         .chain(POLYGON_CHAIN_ID.into())
-        .genesis(Default::default());
+        // Load the real Polygon genesis JSON for completeness
+        .genesis(serde_json::from_str(include_str!("./polygon_genesis.json")).expect("parse genesis"));
 
-    // Configure Polygon-like hardforks (approximate; should mirror Bor mainnet schedule)
+    // Configure Polygon hardforks per Merkle article schedule
     builder = builder
-        .with_fork(EthereumHardfork::Frontier, ForkCondition::Block(0))
-        .with_fork(EthereumHardfork::Homestead, ForkCondition::Block(0))
-        .with_fork(EthereumHardfork::Tangerine, ForkCondition::Block(0))
-        .with_fork(EthereumHardfork::SpuriousDragon, ForkCondition::Block(0))
-        .with_fork(EthereumHardfork::Byzantium, ForkCondition::Block(0))
-        .with_fork(EthereumHardfork::Constantinople, ForkCondition::Block(0))
         .with_fork(EthereumHardfork::Petersburg, ForkCondition::Block(0))
         .with_fork(EthereumHardfork::Istanbul, ForkCondition::Block(3395000))
         .with_fork(EthereumHardfork::MuirGlacier, ForkCondition::Block(3395000))
         .with_fork(EthereumHardfork::Berlin, ForkCondition::Block(14750000))
         .with_fork(EthereumHardfork::London, ForkCondition::Block(23850000))
-        // Post-merge forks (timestamps/TTD not used on Polygon Bor; set as never unless known)
-        ;
+        .with_fork(EthereumHardfork::Shanghai, ForkCondition::Block(SHANGHAI_BLOCK));
 
     let mut spec = builder.build();
-    // Override genesis header hash without recomputing trie
+    // Override genesis header hash to the known Polygon genesis
     spec.genesis_header = sealed;
-    spec.base_fee_params = BaseFeeParamsKind::Constant(BaseFeeParams::new(70, 60));
+    spec.base_fee_params = polygon_base_fee_params();
 
     Arc::new(spec)
 }
@@ -61,10 +56,60 @@ static BOOTNODES: [&str; 12] = [
 ];
 
 pub(crate) fn head() -> Head {
-    Head { number: SHANGHAI_BLOCK, ..Default::default() }
+    let number = env::var("POLY_HEAD_BLOCK")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(SHANGHAI_BLOCK);
+    Head { number, ..Default::default() }
 }
 
 pub(crate) fn boot_nodes() -> Vec<NodeRecord> {
     BOOTNODES[..].iter().map(|s| s.parse().unwrap()).collect()
 }
 
+
+fn polygon_base_fee_params() -> BaseFeeParamsKind {
+    // Align with intent of BaseFeeParams::polygon() from the article.
+    // Keep constants we used previously to avoid behavior change.
+    BaseFeeParamsKind::Constant(BaseFeeParams::new(70, 60))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{head, polygon_chain_spec};
+
+    #[test]
+    fn print_polygon_forkid() {
+        let fork_id = polygon_chain_spec().fork_id(&head());
+        let h = fork_id.hash.0;
+        println!(
+            "polygon forkid = 0x{:02x}{:02x}{:02x}{:02x}, next = {}",
+            h[0], h[1], h[2], h[3], fork_id.next
+        );
+    }
+
+    #[test]
+    fn emit_polygon_forkids() {
+        let spec = polygon_chain_spec();
+        let sample_heads = [
+            0u64,
+            3394999,
+            3395000,
+            14749999,
+            14750000,
+            23849999,
+            23850000,
+            super::SHANGHAI_BLOCK,
+        ];
+        for n in sample_heads { 
+            let h = reth_chainspec::Head { number: n, ..Default::default() };
+            let fid = spec.fork_id(&h);
+            let b = fid.hash.0;
+            println!(
+                "head={n:>8} forkid=0x{:02x}{:02x}{:02x}{:02x} next={}",
+                b[0], b[1], b[2], b[3], fid.next
+            );
+        }
+    }
+}

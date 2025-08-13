@@ -50,7 +50,9 @@ async fn main() {
         .lookup_interval(interval)
         .external_ip_resolver(Some(nat))
         .resolve_external_ip_interval(Some(Duration::from_secs(60)))
-        .add_eip868_pair("eth", fork_id);
+        .add_eip868_pair("eth", fork_id)
+        .add_eip868_pair("matic", fork_id)
+        .add_eip868_pair("polygon", fork_id);
     let net_cfg = net_cfg.set_discovery_v4(discv4_cfg.build());
 
     let net_manager = NetworkManager::eth(net_cfg).await.unwrap();
