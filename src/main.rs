@@ -13,6 +13,7 @@
 #![warn(unused_crate_dependencies)]
 
 use chain_cfg::{boot_nodes, head, polygon_chain_spec};
+use alloy_consensus::transaction::Transaction as _;
 use reth_discv4::{Discv4ConfigBuilder, NatResolver};
 use reth_ethereum::network::{
     api::events::SessionInfo, config::NetworkMode, NetworkConfig, NetworkEvent,
@@ -23,6 +24,10 @@ use reth_tracing::{
     tracing::info, tracing_subscriber::filter::LevelFilter, LayerInfo, LogFormat, RethTracer,
     Tracer,
 };
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use chrono::Local;
+use alloy_sol_types::SolType as _;
 use reth_ecies::stream::ECIESStream;
 use reth_ethereum::network::eth_wire::{EthMessage, EthStream, HelloMessage, P2PStream, UnauthedEthStream, UnauthedP2PStream, UnifiedStatus};
 use reth_ethereum::network::EthNetworkPrimitives;
@@ -44,6 +49,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod chain_cfg;
+mod analysis;
 
 fn persist_session_established(info: &SessionInfo) {
     const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/session_established.log");
@@ -51,9 +57,9 @@ fn persist_session_established(info: &SessionInfo) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
         let line = format!(
-            "{} peer_id={} client={} chain={:?} version={:?}\n",
+            "ts_local={} peer_id={} client={} chain={:?} version={:?}\n",
             ts, info.peer_id, info.client_version, info.status.chain, info.version
         );
         let _ = f.write_all(line.as_bytes());
@@ -66,12 +72,170 @@ fn persist_mempool_sample(peer: &str, hashes_sample: &[String], txs_count: usize
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
         let _ = f.write_all(
-            format!("{} peer={} hashes={} txs={} sample=[{}]\n", ts, peer, hashes_sample.len(), txs_count, hashes_sample.join(","))
+            format!("ts_local={} peer={} hashes={} txs={} sample=[{}]\n", ts, peer, hashes_sample.len(), txs_count, hashes_sample.join(","))
                 .as_bytes(),
         );
     }
+}
+
+fn persist_tx_analysis(results: &[analysis::TxAnalysisResult]) {
+    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/tx_analysis.jsonl");
+    if let Some(dir) = Path::new(FILE).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
+        for r in results {
+            if let Ok(mut v) = serde_json::to_value(r) {
+                if let serde_json::Value::Object(ref mut obj) = v {
+                    obj.insert(
+                        "ts_local".to_string(),
+                        serde_json::Value::String(Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+                    );
+                }
+                if let Ok(line) = serde_json::to_string(&v) {
+                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.write_all(b"\n");
+                }
+            }
+        }
+    }
+}
+
+fn persist_ctf_tx(line: &str) {
+    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/ctf_tx.jsonl");
+    if let Some(dir) = Path::new(FILE).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let serde_json::Value::Object(ref mut obj) = v {
+                obj.insert("ts_local".to_string(), serde_json::Value::String(Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string()));
+            }
+            if let Ok(out) = serde_json::to_string(&v) { let _ = f.write_all(out.as_bytes()); let _ = f.write_all(b"\n"); return; }
+        }
+        // 回退：直接前置文本
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
+
+fn build_method_map(abi_json_str: &str) -> HashMap<[u8;4], String> {
+    use sha3::{Digest, Keccak256};
+    use serde_json::Value;
+
+    fn canonical_type(p: &Value) -> Option<String> {
+        let ty = p.get("type")?.as_str()?;
+        if let Some(rest) = ty.strip_prefix("tuple") {
+            let comps = p.get("components")?.as_array()?;
+            let inner: Vec<String> = comps.iter().map(|c| canonical_type(c)).collect::<Option<Vec<_>>>()?;
+            Some(format!("({}){}", inner.join(","), rest))
+        } else {
+            Some(ty.to_string())
+        }
+    }
+
+    let v: serde_json::Value = serde_json::from_str(abi_json_str).expect("abi json");
+    let arr = v.as_array().expect("abi array");
+    let mut map: HashMap<[u8;4], String> = HashMap::new();
+    for item in arr {
+        if item.get("type").and_then(|t| t.as_str()) == Some("function") {
+            let name = match item.get("name").and_then(|n| n.as_str()) { Some(n) => n.to_string(), None => continue };
+            let inputs = item.get("inputs").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+            let mut tys: Vec<String> = Vec::with_capacity(inputs.len());
+            for inp in &inputs {
+                if let Some(ct) = canonical_type(inp) { tys.push(ct); } else { tys.push(String::from("unknown")); }
+            }
+            let sig = format!("{}({})", name, tys.join(","));
+            let mut hasher = Keccak256::new();
+            hasher.update(sig.as_bytes());
+            let out = hasher.finalize();
+            map.insert([out[0], out[1], out[2], out[3]], name);
+        }
+    }
+    map
+}
+
+static CTF_METHODS: Lazy<HashMap<[u8;4], String>> = Lazy::new(|| build_method_map(include_str!("../data/ctf_abi.json")));
+static NEGRISK_METHODS: Lazy<HashMap<[u8;4], String>> = Lazy::new(|| build_method_map(include_str!("../data/negrisk_abi.json")));
+
+fn decode_method_from_map(method_id: &[u8], map: &HashMap<[u8;4], String>) -> Option<String> {
+    if method_id.len() < 4 { return None; }
+    let key = [method_id[0], method_id[1], method_id[2], method_id[3]];
+    map.get(&key).cloned()
+}
+
+fn decode_ctf_like_calldata(to: alloy_primitives::Address, calldata: &[u8]) -> Option<serde_json::Value> {
+    // 仅支持两个目标合约，按 method selector 在各自 ABI 中查找，再利用 alloy-json-abi 的 Function decoder 做解码
+    if calldata.len() < 4 { return None; }
+    let sel = [calldata[0], calldata[1], calldata[2], calldata[3]];
+    let (name_opt, func_opt) = if to == alloy_primitives::address!("0x56C79347e95530c01A2FC76E732f9566dA16E113") {
+        let name = CTF_METHODS.get(&sel).cloned();
+        let func = find_function_by_selector(include_str!("../data/ctf_abi.json"), &sel);
+        (name, func)
+    } else if to == alloy_primitives::address!("0x78769D50Be1763ed1CA0D5E878D93f05aabff29e") {
+        let name = NEGRISK_METHODS.get(&sel).cloned();
+        let func = find_function_by_selector(include_str!("../data/negrisk_abi.json"), &sel);
+        (name, func)
+    } else { return None };
+
+    let (name, func) = match (name_opt, func_opt) { (Some(n), Some(f)) => (n, f), _ => return None };
+    let args_bytes = &calldata[4..];
+    // 用 ethers-core 的 ABI 解码器以 JSON ABI function 描述进行解码
+    let abi_func: ethers_core::abi::Function = serde_json::from_value(serde_json::to_value(&func).ok()?).ok()?;
+    let params = abi_func.decode_input(args_bytes).ok()?;
+    Some(function_tokens_to_json_ethers(&name, &params))
+}
+
+fn find_function_by_selector(abi_str: &str, sel: &[u8;4]) -> Option<alloy_json_abi::Function> {
+    let v: serde_json::Value = serde_json::from_str(abi_str).ok()?;
+    let arr = v.as_array()?;
+    for item in arr {
+        if item.get("type").and_then(|t| t.as_str()) == Some("function") {
+            // 重建 selector
+            use sha3::{Digest, Keccak256};
+            let name = item.get("name")?.as_str()?;
+            let inputs = item.get("inputs")?.as_array()?.clone();
+            fn canonical_type(p: &serde_json::Value) -> Option<String> {
+                let ty = p.get("type")?.as_str()?;
+                if let Some(rest) = ty.strip_prefix("tuple") {
+                    let comps = p.get("components")?.as_array()?;
+                    let inner: Vec<String> = comps.iter().map(|c| canonical_type(c)).collect::<Option<Vec<_>>>()?;
+                    Some(format!("({}){}", inner.join(","), rest))
+                } else { Some(ty.to_string()) }
+            }
+            let mut tys = Vec::with_capacity(inputs.len());
+            for inp in &inputs { tys.push(canonical_type(inp)?); }
+            let sig = format!("{}({})", name, tys.join(","));
+            let mut h = Keccak256::new(); h.update(sig.as_bytes()); let out = h.finalize();
+            if &out[..4] == sel {
+                // 直接反序列化为 Function 以便 decode
+                return serde_json::from_value(item.clone()).ok();
+            }
+        }
+    }
+    None
+}
+
+fn function_tokens_to_json_ethers(name: &str, tokens: &[ethers_core::abi::Token]) -> serde_json::Value {
+    use ethers_core::abi::Token as T;
+    fn tok_to_val(t: &T) -> serde_json::Value {
+        match t {
+            T::Address(a) => serde_json::json!(format!("0x{:x}", a)),
+            T::Uint(u) => serde_json::json!(u.to_string()),
+            T::Int(i) => serde_json::json!(i.to_string()),
+            T::Bool(b) => serde_json::json!(b),
+            T::Bytes(b) => serde_json::json!(format!("0x{}", hex::encode(b))),
+            T::String(s) => serde_json::json!(s),
+            T::FixedBytes(b) => serde_json::json!(format!("0x{}", hex::encode(b))),
+            T::Array(v) => serde_json::Value::Array(v.iter().map(tok_to_val).collect()),
+            T::FixedArray(v) => serde_json::Value::Array(v.iter().map(tok_to_val).collect()),
+            T::Tuple(v) => serde_json::Value::Array(v.iter().map(tok_to_val).collect()),
+        }
+    }
+    let params: Vec<serde_json::Value> = tokens.iter().map(tok_to_val).collect();
+    serde_json::json!({ "method": name, "args": params })
 }
 
 fn persist_peer_event(line: &str) {
@@ -80,8 +244,8 @@ fn persist_peer_event(line: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let _ = f.write_all(format!("{} {}\n", ts, line).as_bytes());
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
+        let _ = f.write_all(format!("ts_local={} {}\n", ts, line).as_bytes());
     }
 }
 
@@ -199,30 +363,70 @@ async fn main() {
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let peer_req = PeerRequest::GetPooledTransactions { request, response: resp_tx };
                             handle.send_request(peer_id, peer_req);
-                            match resp_rx.await {
-                                Ok(Ok(PooledTransactions(txs))) => {
+                            match tokio::time::timeout(Duration::from_millis(2500), resp_rx).await {
+                                Ok(Ok(Ok(PooledTransactions(txs)))) => {
                                     let sample: Vec<String> = hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
                                     persist_mempool_sample(&format!("{}", peer_id), &sample, txs.len());
                                     info!(peer = %peer_id, hashes = hashes.len(), txs = txs.len(), "mempool: fetched txs from hashes broadcast");
                                 }
-                                Ok(Err(e)) => {
+                                Ok(Ok(Err(e))) => {
                                     info!(peer = %peer_id, error = %e, "mempool: peer request failed");
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     info!(peer = %peer_id, error = %e, "mempool: response channel closed");
+                                }
+                                Err(_) => {
+                                    info!(peer = %peer_id, "mempool: request timeout (2.5s), drop stale response");
                                 }
                             }
                         });
                     }
                 }
                 NetworkTransactionEvent::IncomingTransactions { peer_id, msg } => {
-                    // 直接处理 full tx 的广播：并发写盘/处理，避免阻塞接收端
+                    // 直接处理 full tx 的广播：解析并异步落盘
                     let txs = msg.0;
                     tokio::spawn(async move {
-                        let count = txs.len();
-                        let sample: Vec<String> = txs.iter().take(8).map(|tx| format!("0x{:x}", tx.hash())).collect();
+                        // 只对特定 receiver 做 input 解析，其余不含 calldata 以节省 IO
+                        let want1 = alloy_primitives::address!("0x56C79347e95530c01A2FC76E732f9566dA16E113");
+                        let want2 = alloy_primitives::address!("0x78769D50Be1763ed1CA0D5E878D93f05aabff29e");
+                        let analyses: Vec<_> = txs
+                            .iter()
+                            .map(|tx| {
+                                let to = tx.to();
+                                let include = matches!(to, Some(a) if a == want1 || a == want2);
+                                analysis::analyze_transaction_filtered(tx, include)
+                            })
+                            .collect();
+                        let count = analyses.len();
+                        let sample: Vec<String> = analyses.iter().take(8).map(|a| format!("0x{:x}", a.hash)).collect();
                         persist_mempool_sample(&format!("{}", peer_id), &sample, count);
-                        info!(peer = %peer_id, count, "mempool: received full transactions broadcast");
+                        persist_tx_analysis(&analyses);
+
+                        // 额外输出 CTF 合约详情到独立日志：包含方法名称（若能从 ABI 匹配）
+                        for a in &analyses {
+                            if let (Some(to), Some(calldata_hex)) = (a.receiver, a.calldata_hex.as_ref()) {
+                                let is_ctf = to == want1;
+                                let is_neg = to == want2;
+                                if is_ctf || is_neg {
+                                    let bytes = match calldata_hex.strip_prefix("0x") { Some(h) => h, None => calldata_hex };
+                                    if let Ok(b) = hex::decode(bytes) {
+                                        let decoded = decode_ctf_like_calldata(to, &b[..]);
+                                        let line = serde_json::json!({
+                                            "hash": format!("0x{:x}", a.hash),
+                                            "to": format!("0x{:x}", to),
+                                            "value": format!("{}", a.value),
+                                            "gas_limit": a.gas_limit,
+                                            "gas_price_or_max_fee": a.gas_price_or_max_fee,
+                                            "max_priority_fee": a.max_priority_fee,
+                                            "decoded": decoded,
+                                        }).to_string();
+                                        persist_ctf_tx(&line);
+                                    }
+                                }
+                            }
+                        }
+
+                        info!(peer = %peer_id, count, "mempool: received full transactions broadcast (analyzed + persisted)");
                     });
                 }
                 NetworkTransactionEvent::GetPooledTransactions { peer_id, request, response } => {
