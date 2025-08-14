@@ -71,7 +71,7 @@ static BOOTNODES: [&str; 4] = [
 ];
 
 pub(crate) fn head() -> Head {
-    // 使用最新 Prague 高度作为默认 Head
+    // 使用最新 Prague 高度作为默认 Head（与 @src 行为保持一致，不依赖 RPC）
     let h = Head { number: PRAGUE_BLOCK, ..Default::default() };
     debug!(target: "polygon", number = h.number, "返回默认 Head（Prague 高度）");
     h

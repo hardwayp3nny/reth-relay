@@ -18,6 +18,7 @@ use reth_ethereum::network::{
     api::events::SessionInfo, config::NetworkMode, NetworkConfig, NetworkEvent,
     NetworkEventListenerProvider, NetworkManager,
 };
+use reth_ethereum::network::transactions::NetworkTransactionEvent;
 use reth_tracing::{
     tracing::info, tracing_subscriber::filter::LevelFilter, LayerInfo, LogFormat, RethTracer,
     Tracer,
@@ -25,6 +26,7 @@ use reth_tracing::{
 use reth_ecies::stream::ECIESStream;
 use reth_ethereum::network::eth_wire::{EthMessage, EthStream, HelloMessage, P2PStream, UnauthedEthStream, UnauthedP2PStream, UnifiedStatus};
 use reth_ethereum::network::EthNetworkPrimitives;
+use reth_network::PeerRequest;
 use reth_network_peers::{pk2id, NodeRecord, PeerId};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
@@ -97,8 +99,9 @@ async fn main() {
         ))
         .init();
 
-    // The local address we want to bind to
-    let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 30303);
+    // The local address we want to bind to (use env P2P_PORT or 0 for ephemeral port)
+    let port: u16 = std::env::var("P2P_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
 
     // The network configuration with aggressive peers/session tuning
     let peers_cfg = PeersConfig::default()
@@ -141,27 +144,22 @@ async fn main() {
     discv4_cfg.add_boot_nodes(boot).lookup_interval(interval);
     let net_cfg = net_cfg.set_discovery_v4(discv4_cfg.build());
 
-    let net_manager = NetworkManager::eth(net_cfg).await.unwrap();
+    let mut net_manager = NetworkManager::eth(net_cfg).await.unwrap();
 
     // The network handle is our entrypoint into the network.
     let net_handle = net_manager.handle().clone();
     let mut events = net_handle.event_listener();
     let mut disc_stream = net_handle.discovery_listener();
 
+    // 注册交易事件通道，接收 mempool 广播/请求
+    let (tx_event_tx, mut tx_event_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkTransactionEvent>();
+    net_manager.set_transactions(tx_event_tx);
+
     // NetworkManager is a long running task, let's spawn it
     tokio::spawn(net_manager);
     info!("Looking for Polygon peers...");
 
-    // 监听发现事件（节点被发现/返回 ENR ForkId）
-    let net_handle_for_disc = net_handle.clone();
-    // 高并发嗅探控制：可通过环境变量 SNOOP_MAX_CONCURRENCY 配置，默认 256
-    let snoop_max: usize = std::env::var("SNOOP_MAX_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
-    let snoop_sem = std::sync::Arc::new(Semaphore::new(snoop_max));
-    // 已嗅探或正在嗅探的 peer 去重
-    let seen = std::sync::Arc::new(Mutex::new(std::collections::HashSet::<PeerId>::new()));
+    // 监听发现事件（仅记录日志，不再手工直连嗅探，避免不合规会话被远端清理）
     tokio::spawn(async move {
         use reth_ethereum::network::api::events::{DiscoveryEvent, DiscoveredEvent};
         while let Some(evt) = disc_stream.next().await {
@@ -169,67 +167,74 @@ async fn main() {
                 DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, addr, fork_id }) => {
                     info!(%peer_id, addr=?addr, fork=?fork_id, "discovery: queued new node");
                     persist_peer_event(&format!("discovery_queued peer_id={} addr={:?} fork={:?}", peer_id, addr, fork_id));
-                    // 对新发现节点尝试底层握手 + 监听 mempool 广播
-                    let chainspec = chain_cfg::polygon_chain_spec();
-                    let head = chain_cfg::head();
-                    let fork_filter = chainspec.fork_filter(head);
-                    let status = UnifiedStatus::spec_builder(&chainspec, &head);
-                    let peer_enode: NodeRecord = NodeRecord::new(addr.tcp(), peer_id);
-                    let sk = *net_handle_for_disc.secret_key();
-                    let sem = snoop_sem.clone();
-                    let seen_peers = seen.clone();
-                    tokio::spawn(async move {
-                        // 去重：同一个 peer 只嗅探一次
-                        {
-                            let mut s = seen_peers.lock().await;
-                            if !s.insert(peer_id) {
-                                return;
-                            }
-                        }
-                        // 并发限制
-                        let permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
-                        // 连接并握手 P2P
-                        if let Ok(Ok(outgoing)) = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(peer_enode.tcp_addr())).await {
-                            if let Ok(ecies) = ECIESStream::connect(outgoing, sk, peer_enode.id).await {
-                                let our_peer_id = pk2id(&sk.public_key(secp256k1::SECP256K1));
-                                let hello = HelloMessage::builder(our_peer_id).build();
-                                if let Ok((p2p_stream, _their_hello)) = UnauthedP2PStream::new(ecies).handshake(hello).await {
-                                    // ETH 握手
-                                    let mut status = status.clone();
-                                    if let Ok(ver) = p2p_stream.shared_capabilities().eth().map(|v| v.version()) {
-                                        status.version = ver.try_into().unwrap_or(status.version);
-                                    }
-                                    if let Ok((mut eth_stream, _their_status)) = UnauthedEthStream::new(p2p_stream).handshake::<EthNetworkPrimitives>(status, fork_filter).await {
-                                        // 监听广播
-                                        while let Some(Ok(update)) = eth_stream.next().await {
-                                            match update {
-                                                EthMessage::NewPooledTransactionHashes66(txs) => {
-                                                    let count = txs.0.len();
-                                                    let sample: Vec<String> = txs.0.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
-                                                    persist_mempool_sample(&format!("{}", peer_enode.id), &sample, count);
-                                                }
-                                                EthMessage::NewPooledTransactionHashes68(txs) => {
-                                                    let count = txs.hashes.len();
-                                                    let sample: Vec<String> = txs.hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
-                                                    persist_mempool_sample(&format!("{}", peer_enode.id), &sample, count);
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        drop(permit);
-                    });
                 }
                 DiscoveryEvent::EnrForkId(peer_id, fork) => {
                     info!(%peer_id, fork=?fork, "discovery: enr forkid");
                     persist_peer_event(&format!("enr_fork peer_id={} fork={:?}", peer_id, fork));
                 }
+            }
+        }
+    });
+
+    // 交易事件处理（独立任务，必须在事件循环之前启动）
+    // 重要：对每个广播请求并发处理，避免阻塞接收端导致积压，从而处理到“很久以前”的广播
+    let handle_for_tx = net_handle.clone();
+    let tx_req_semaphore = std::sync::Arc::new(Semaphore::new(128));
+    tokio::spawn(async move {
+        use reth_ethereum::network::eth_wire::{GetPooledTransactions, NewPooledTransactionHashes, PooledTransactions};
+        use tokio::sync::oneshot;
+        while let Some(event) = tx_event_rx.recv().await {
+            match event {
+                NetworkTransactionEvent::IncomingPooledTransactionHashes { peer_id, msg } => {
+                    let hashes: Vec<_> = match msg {
+                        NewPooledTransactionHashes::Eth66(h) => h.0,
+                        NewPooledTransactionHashes::Eth68(h) => h.hashes,
+                    };
+                    if !hashes.is_empty() {
+                        let permit = tx_req_semaphore.clone().acquire_owned().await;
+                        let handle = handle_for_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = match permit { Ok(p) => p, Err(_) => return };
+                            let request = GetPooledTransactions(hashes.clone());
+                            let (resp_tx, resp_rx) = oneshot::channel();
+                            let peer_req = PeerRequest::GetPooledTransactions { request, response: resp_tx };
+                            handle.send_request(peer_id, peer_req);
+                            match resp_rx.await {
+                                Ok(Ok(PooledTransactions(txs))) => {
+                                    let sample: Vec<String> = hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
+                                    persist_mempool_sample(&format!("{}", peer_id), &sample, txs.len());
+                                    info!(peer = %peer_id, hashes = hashes.len(), txs = txs.len(), "mempool: fetched txs from hashes broadcast");
+                                }
+                                Ok(Err(e)) => {
+                                    info!(peer = %peer_id, error = %e, "mempool: peer request failed");
+                                }
+                                Err(e) => {
+                                    info!(peer = %peer_id, error = %e, "mempool: response channel closed");
+                                }
+                            }
+                        });
+                    }
+                }
+                NetworkTransactionEvent::IncomingTransactions { peer_id, msg } => {
+                    // 直接处理 full tx 的广播：并发写盘/处理，避免阻塞接收端
+                    let txs = msg.0;
+                    tokio::spawn(async move {
+                        let count = txs.len();
+                        let sample: Vec<String> = txs.iter().take(8).map(|tx| format!("0x{:x}", tx.hash())).collect();
+                        persist_mempool_sample(&format!("{}", peer_id), &sample, count);
+                        info!(peer = %peer_id, count, "mempool: received full transactions broadcast");
+                    });
+                }
+                NetworkTransactionEvent::GetPooledTransactions { peer_id, request, response } => {
+                    // 仍可最小应答，但为了减少重复请求积压，限制频率：过大批次直接返回空
+                    if request.0.len() > 512 {
+                        let _ = response.send(Ok(PooledTransactions::default()));
+                    } else {
+                        let _ = response.send(Ok(PooledTransactions::default()));
+                    }
+                    info!(peer = %peer_id, count = request.0.len(), "mempool: answered GetPooledTransactions (rate-limited)");
+                }
+                _ => {}
             }
         }
     });
@@ -241,36 +246,7 @@ async fn main() {
                 let chain = status.chain;
                 info!(?chain, ?client_version, "Session established with a new peer.");
                 persist_session_established(&info);
-                // 主动向该 peer 请求 mempool 交易
-                let handle = net_handle.clone();
-                let session_info = info.clone();
-                tokio::spawn(async move {
-                    if let Some(txh) = handle.transactions_handle().await {
-                        let peer_id = session_info.peer_id;
-                        match txh.get_peer_transaction_hashes(peer_id).await {
-                            Ok(set) => {
-                                let mut hashes: Vec<_> = set.into_iter().collect();
-                                let take_n = hashes.len().min(128);
-                                hashes.truncate(take_n);
-                                let req: Vec<_> = hashes.iter().cloned().collect();
-                                match txh.get_pooled_transactions_from(peer_id, req).await {
-                                    Ok(Some(txs)) => {
-                                        let sample: Vec<String> = hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
-                                        persist_mempool_sample(&format!("{}", peer_id), &sample, txs.len());
-                                        info!(peer = %peer_id, hashes = hashes.len(), txs = txs.len(), "mempool: fetched pooled transactions");
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        info!(peer = %peer_id, error = %e, "mempool: failed to get pooled txs");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                info!(peer = %session_info.peer_id, error = %e, "mempool: failed to get peer tx hashes");
-                            }
-                        }
-                    }
-                });
+                // 周期性轮询移除，改为：收到广播后用 PeerRequest 拉取，降低内部通道关闭导致的 panic 风险
             }
             NetworkEvent::Peer(peer_evt) => {
                 match peer_evt {
