@@ -23,7 +23,7 @@ use reth_tracing::{
     Tracer,
 };
 use reth_ecies::stream::ECIESStream;
-use reth_ethereum::network::eth_wire::{EthMessage, EthStream, HelloMessage, P2PStream, UnauthedEthStream, UnauthedP2PStream, UnifiedStatus};
+use reth_ethereum::network::eth_wire::{EthMessage, HelloMessage, UnauthedEthStream, UnauthedP2PStream, UnifiedStatus};
 use reth_ethereum::network::EthNetworkPrimitives;
 use reth_network_peers::{pk2id, NodeRecord, PeerId};
 use tokio::net::TcpStream;
@@ -35,11 +35,16 @@ use std::{
 };
 use tokio_stream::StreamExt;
 use reth_network_types::{PeersConfig, SessionsConfig};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use serde_json::json;
+use alloy_consensus::transaction::Transaction as _;
+use alloy_consensus::transaction::SignerRecoverable as _;
+use alloy_primitives::{Address, B256, TxKind};
 
 pub mod chain_cfg;
 
@@ -81,6 +86,70 @@ fn persist_peer_event(line: &str) {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let _ = f.write_all(format!("{} {}\n", ts, line).as_bytes());
     }
+}
+
+fn persist_tps_line(inst_tps: u64, avg60: f64) {
+    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/tps.log");
+    if let Some(dir) = Path::new(FILE).parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = f.write_all(format!("{} tps={} avg60={:.2}\n", ts, inst_tps, avg60).as_bytes());
+    }
+}
+
+fn persist_tx_json(tx_json: &serde_json::Value) {
+    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/txs.jsonl");
+    if let Some(dir) = Path::new(FILE).parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
+        let _ = f.write_all(tx_json.to_string().as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
+
+fn format_address(addr: &Address) -> String { format!("0x{:x}", addr) }
+fn format_b256(h: &B256) -> String { format!("0x{:x}", h) }
+
+fn tx_to_json(ts: u64, peer: &str, tx: &reth_ethereum_primitives::PooledTransactionVariant) -> serde_json::Value {
+    let hash = tx.hash();
+    let nonce = tx.nonce();
+    let gas_limit = tx.gas_limit();
+    let gas_price = tx.gas_price();
+    let max_fee_per_gas = tx.max_fee_per_gas();
+    let max_priority_fee_per_gas = tx.max_priority_fee_per_gas();
+    let chain_id = tx.chain_id();
+    let value = tx.value();
+    let input_len = tx.input().len();
+    let to = match tx.kind() { TxKind::Call(to) => Some(format_address(&to)), TxKind::Create => None };
+    let from = tx.recover_signer().ok().map(|a| format_address(&a));
+    // Infer tx type by presence of features
+    let tx_type = if tx.authorization_list().map(|l| !l.is_empty()).unwrap_or(false) {
+        "eip7702"
+    } else if tx.blob_versioned_hashes().map(|l| !l.is_empty()).unwrap_or(false) {
+        "eip4844"
+    } else if tx.max_priority_fee_per_gas().is_some() {
+        "eip1559"
+    } else if tx.access_list().map(|l| !l.0.is_empty()).unwrap_or(false) {
+        "eip2930"
+    } else {
+        "legacy"
+    };
+
+    json!({
+        "ts": ts,
+        "peer": peer,
+        "hash": format_b256(&hash),
+        "tx_type": tx_type,
+        "gas_limit": gas_limit,
+        "gas_price": gas_price.map(|v| v.to_string()),
+        "max_fee_per_gas": max_fee_per_gas.to_string(),
+        "max_priority_fee_per_gas": max_priority_fee_per_gas.map(|v| v.to_string()),
+        "to": to,
+        "from": from,
+        "nonce": nonce,
+        "value": value.to_string(),
+        "chain_id": chain_id.map(|v| v.to_string()),
+        "input_len": input_len,
+    })
 }
 
 #[tokio::main]
@@ -152,8 +221,66 @@ async fn main() {
     tokio::spawn(net_manager);
     info!("Looking for Polygon peers...");
 
+    // === TPS Reporter ===
+    let tps_counter = Arc::new(AtomicU64::new(0));
+    let tps_counter_bg = tps_counter.clone();
+    tokio::spawn(async move {
+        let mut window: VecDeque<u64> = VecDeque::with_capacity(60);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let count = tps_counter_bg.swap(0, Ordering::Relaxed);
+            if window.len() == 60 { window.pop_front(); }
+            window.push_back(count);
+            let sum: u64 = window.iter().copied().sum();
+            let avg = if window.is_empty() { 0.0 } else { sum as f64 / window.len() as f64 };
+            persist_tps_line(count, avg);
+        }
+    });
+
+    // === Hash queue + Workers for GetPooledTransactions ===
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<(PeerId, Vec<B256>)>(10_000);
+    let fetch_workers: usize = std::env::var("FETCH_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let batch_size: usize = std::env::var("BATCH_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let fetch_sem = Arc::new(Semaphore::new(fetch_workers));
+    {
+        let handle = net_handle.clone();
+        let fetch_sem = fetch_sem.clone();
+        tokio::spawn(async move {
+            while let Some((peer_id, hashes)) = hash_rx.recv().await {
+                if hashes.is_empty() { continue; }
+                let permit = match fetch_sem.clone().acquire_owned().await { Ok(p) => p, Err(_) => continue };
+                let handle2 = handle.clone();
+                let hashes2 = hashes.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Some(txh) = handle2.transactions_handle().await {
+                        for chunk in hashes2.chunks(batch_size) {
+                            match txh.get_pooled_transactions_from(peer_id, chunk.to_vec()).await {
+                                Ok(Some(txs)) => {
+                                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    for tx in txs.iter() {
+                                        let js = tx_to_json(ts, &format!("{}", peer_id), tx);
+                                        persist_tx_json(&js);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    info!(peer = %peer_id, error = %e, "worker: failed to get pooled txs");
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                });
+            }
+        });
+    }
+
     // 监听发现事件（节点被发现/返回 ENR ForkId）
     let net_handle_for_disc = net_handle.clone();
+    let hash_tx_for_disc = hash_tx.clone();
     // 高并发嗅探控制：可通过环境变量 SNOOP_MAX_CONCURRENCY 配置，默认 256
     let snoop_max: usize = std::env::var("SNOOP_MAX_CONCURRENCY")
         .ok()
@@ -178,6 +305,8 @@ async fn main() {
                     let sk = *net_handle_for_disc.secret_key();
                     let sem = snoop_sem.clone();
                     let seen_peers = seen.clone();
+                    let tx_hash_sender = hash_tx_for_disc.clone();
+                    let tps = tps_counter.clone();
                     tokio::spawn(async move {
                         // 去重：同一个 peer 只嗅探一次
                         {
@@ -210,11 +339,15 @@ async fn main() {
                                                     let count = txs.0.len();
                                                     let sample: Vec<String> = txs.0.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
                                                     persist_mempool_sample(&format!("{}", peer_enode.id), &sample, count);
+                                                    tps.fetch_add(count as u64, Ordering::Relaxed);
+                                                    let _ = tx_hash_sender.try_send((peer_enode.id, txs.0));
                                                 }
                                                 EthMessage::NewPooledTransactionHashes68(txs) => {
                                                     let count = txs.hashes.len();
                                                     let sample: Vec<String> = txs.hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
                                                     persist_mempool_sample(&format!("{}", peer_enode.id), &sample, count);
+                                                    tps.fetch_add(count as u64, Ordering::Relaxed);
+                                                    let _ = tx_hash_sender.try_send((peer_enode.id, txs.hashes));
                                                 }
                                                 _ => {}
                                             }
@@ -241,9 +374,10 @@ async fn main() {
                 let chain = status.chain;
                 info!(?chain, ?client_version, "Session established with a new peer.");
                 persist_session_established(&info);
-                // 主动向该 peer 请求 mempool 交易
+                // 主动向该 peer 请求 mempool 交易（仅将哈希推入队列，正文由 worker 拉取）
                 let handle = net_handle.clone();
                 let session_info = info.clone();
+                let tx_hash_sender = hash_tx.clone();
                 tokio::spawn(async move {
                     if let Some(txh) = handle.transactions_handle().await {
                         let peer_id = session_info.peer_id;
@@ -252,18 +386,9 @@ async fn main() {
                                 let mut hashes: Vec<_> = set.into_iter().collect();
                                 let take_n = hashes.len().min(128);
                                 hashes.truncate(take_n);
-                                let req: Vec<_> = hashes.iter().cloned().collect();
-                                match txh.get_pooled_transactions_from(peer_id, req).await {
-                                    Ok(Some(txs)) => {
-                                        let sample: Vec<String> = hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
-                                        persist_mempool_sample(&format!("{}", peer_id), &sample, txs.len());
-                                        info!(peer = %peer_id, hashes = hashes.len(), txs = txs.len(), "mempool: fetched pooled transactions");
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        info!(peer = %peer_id, error = %e, "mempool: failed to get pooled txs");
-                                    }
-                                }
+                                let sample: Vec<String> = hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
+                                persist_mempool_sample(&format!("{}", peer_id), &sample, 0);
+                                let _ = tx_hash_sender.send((peer_id, hashes));
                             }
                             Err(e) => {
                                 info!(peer = %session_info.peer_id, error = %e, "mempool: failed to get peer tx hashes");
