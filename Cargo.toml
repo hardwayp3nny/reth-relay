@@ -25,3 +25,5 @@ reth-network-peers = { git = "https://github.com/paradigmxyz/reth", package = "r
 
 # Alloy genesis crate aligned with Reth
 alloy-genesis = "1.0.24"
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", package = "reth-ethereum-primitives" }
+alloy-consensus = { version = "1.0.24", default-features = false }

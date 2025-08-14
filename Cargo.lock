@@ -1742,6 +1742,7 @@ dependencies = [
 name = "example-polygon-p2p"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-genesis",
  "alloy-primitives",
  "rand 0.8.5",
@@ -1749,6 +1750,7 @@ dependencies = [
  "reth-discv4",
  "reth-ecies",
  "reth-ethereum",
+ "reth-ethereum-primitives",
  "reth-network-peers",
  "reth-network-types",
  "reth-primitives",
