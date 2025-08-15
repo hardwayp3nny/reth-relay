@@ -27,14 +27,10 @@ use reth_tracing::{
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use chrono::Local;
-use alloy_sol_types::SolType as _;
-use reth_ecies::stream::ECIESStream;
-use reth_ethereum::network::eth_wire::{EthMessage, EthStream, HelloMessage, P2PStream, UnauthedEthStream, UnauthedP2PStream, UnifiedStatus};
-use reth_ethereum::network::EthNetworkPrimitives;
 use reth_network::PeerRequest;
-use reth_network_peers::{pk2id, NodeRecord, PeerId};
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
+use std::fs::OpenOptions;
+use std::io::Write;
 use secp256k1::{rand, SecretKey};
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -42,14 +38,11 @@ use std::{
 };
 use tokio_stream::StreamExt;
 use reth_network_types::{PeersConfig, SessionsConfig};
-use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod chain_cfg;
 mod analysis;
+mod redis_manager;
 
 fn persist_session_established(info: &SessionInfo) {
     const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/session_established.log");
@@ -66,60 +59,11 @@ fn persist_session_established(info: &SessionInfo) {
     }
 }
 
-fn persist_mempool_sample(peer: &str, hashes_sample: &[String], txs_count: usize) {
-    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/mempool.log");
-    if let Some(dir) = Path::new(FILE).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
-        let _ = f.write_all(
-            format!("ts_local={} peer={} hashes={} txs={} sample=[{}]\n", ts, peer, hashes_sample.len(), txs_count, hashes_sample.join(","))
-                .as_bytes(),
-        );
-    }
-}
+// 移除mempool文件持久化，改用Redis
 
-fn persist_tx_analysis(results: &[analysis::TxAnalysisResult]) {
-    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/tx_analysis.jsonl");
-    if let Some(dir) = Path::new(FILE).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        for r in results {
-            if let Ok(mut v) = serde_json::to_value(r) {
-                if let serde_json::Value::Object(ref mut obj) = v {
-                    obj.insert(
-                        "ts_local".to_string(),
-                        serde_json::Value::String(Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
-                    );
-                }
-                if let Ok(line) = serde_json::to_string(&v) {
-                    let _ = f.write_all(line.as_bytes());
-                    let _ = f.write_all(b"\n");
-                }
-            }
-        }
-    }
-}
+// 移除tx_analysis文件持久化，改用Redis
 
-fn persist_ctf_tx(line: &str) {
-    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/ctf_tx.jsonl");
-    if let Some(dir) = Path::new(FILE).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let serde_json::Value::Object(ref mut obj) = v {
-                obj.insert("ts_local".to_string(), serde_json::Value::String(Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string()));
-            }
-            if let Ok(out) = serde_json::to_string(&v) { let _ = f.write_all(out.as_bytes()); let _ = f.write_all(b"\n"); return; }
-        }
-        // 回退：直接前置文本
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.write_all(b"\n");
-    }
-}
+// 移除ctf_tx文件持久化，改用Redis
 
 fn build_method_map(abi_json_str: &str) -> HashMap<[u8;4], String> {
     use sha3::{Digest, Keccak256};
@@ -238,19 +182,16 @@ fn function_tokens_to_json_ethers(name: &str, tokens: &[ethers_core::abi::Token]
     serde_json::json!({ "method": name, "args": params })
 }
 
-fn persist_peer_event(line: &str) {
-    const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/peer_events.log");
-    if let Some(dir) = Path::new(FILE).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(FILE) {
-        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
-        let _ = f.write_all(format!("ts_local={} {}\n", ts, line).as_bytes());
-    }
-}
+// 移除peer_events文件持久化
 
 #[tokio::main]
 async fn main() {
+    // 初始化Redis连接
+    if let Err(e) = redis_manager::init_redis().await {
+        eprintln!("Failed to initialize Redis: {}", e);
+        std::process::exit(1);
+    }
+    info!("Redis initialized successfully");
     // The ECDSA private key used to create our enode identifier.
     let secret_key = SecretKey::new(&mut rand::thread_rng());
 
@@ -330,11 +271,9 @@ async fn main() {
             match evt {
                 DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, addr, fork_id }) => {
                     info!(%peer_id, addr=?addr, fork=?fork_id, "discovery: queued new node");
-                    persist_peer_event(&format!("discovery_queued peer_id={} addr={:?} fork={:?}", peer_id, addr, fork_id));
                 }
                 DiscoveryEvent::EnrForkId(peer_id, fork) => {
                     info!(%peer_id, fork=?fork, "discovery: enr forkid");
-                    persist_peer_event(&format!("enr_fork peer_id={} fork={:?}", peer_id, fork));
                 }
             }
         }
@@ -366,8 +305,7 @@ async fn main() {
                             match tokio::time::timeout(Duration::from_millis(2500), resp_rx).await {
                                 Ok(Ok(Ok(PooledTransactions(txs)))) => {
                                     let sample: Vec<String> = hashes.iter().take(8).map(|h| format!("0x{:x}", h)).collect();
-                                    persist_mempool_sample(&format!("{}", peer_id), &sample, txs.len());
-                                    info!(peer = %peer_id, hashes = hashes.len(), txs = txs.len(), "mempool: fetched txs from hashes broadcast");
+                                    info!(peer = %peer_id, hashes = hashes.len(), txs = txs.len(), sample = ?sample, "mempool: fetched txs from hashes broadcast");
                                 }
                                 Ok(Ok(Err(e))) => {
                                     info!(peer = %peer_id, error = %e, "mempool: peer request failed");
@@ -383,7 +321,7 @@ async fn main() {
                     }
                 }
                 NetworkTransactionEvent::IncomingTransactions { peer_id, msg } => {
-                    // 直接处理 full tx 的广播：解析并异步落盘
+                    // 直接处理 full tx 的广播：解析并存储到Redis
                     let txs = msg.0;
                     tokio::spawn(async move {
                         // 只对特定 receiver 做 input 解析，其余不含 calldata 以节省 IO
@@ -399,10 +337,13 @@ async fn main() {
                             .collect();
                         let count = analyses.len();
                         let sample: Vec<String> = analyses.iter().take(8).map(|a| format!("0x{:x}", a.hash)).collect();
-                        persist_mempool_sample(&format!("{}", peer_id), &sample, count);
-                        persist_tx_analysis(&analyses);
+                        
+                        // 存储交易分析结果到Redis
+                        if let Err(e) = redis_manager::store_tx_analysis(&analyses).await {
+                            eprintln!("Failed to store tx analysis to Redis: {}", e);
+                        }
 
-                        // 额外输出 CTF 合约详情到独立日志：包含方法名称（若能从 ABI 匹配）
+                        // 额外输出 CTF 合约详情到Redis：包含方法名称（若能从 ABI 匹配）
                         for a in &analyses {
                             if let (Some(to), Some(calldata_hex)) = (a.receiver, a.calldata_hex.as_ref()) {
                                 let is_ctf = to == want1;
@@ -420,13 +361,16 @@ async fn main() {
                                             "max_priority_fee": a.max_priority_fee,
                                             "decoded": decoded,
                                         }).to_string();
-                                        persist_ctf_tx(&line);
+                                        
+                                        if let Err(e) = redis_manager::store_ctf_tx(&line).await {
+                                            eprintln!("Failed to store CTF tx to Redis: {}", e);
+                                        }
                                     }
                                 }
                             }
                         }
 
-                        info!(peer = %peer_id, count, "mempool: received full transactions broadcast (analyzed + persisted)");
+                        info!(peer = %peer_id, count, sample = ?sample, "mempool: received full transactions broadcast (analyzed + stored to Redis)");
                     });
                 }
                 NetworkTransactionEvent::GetPooledTransactions { peer_id, request, response } => {
@@ -456,20 +400,16 @@ async fn main() {
                 match peer_evt {
                     reth_ethereum::network::api::events::PeerEvent::SessionClosed { peer_id, reason } => {
                         info!(%peer_id, ?reason, "Session closed");
-                        persist_peer_event(&format!("session_closed peer_id={} reason={:?}", peer_id, reason));
                     }
                     reth_ethereum::network::api::events::PeerEvent::SessionEstablished(info) => {
                         info!(peer_id = %info.peer_id, client = %info.client_version, "Peer session established");
                         persist_session_established(&info);
-                        persist_peer_event(&format!("session_established peer_id={} client={} version={:?}", info.peer_id, info.client_version, info.version));
                     }
                     reth_ethereum::network::api::events::PeerEvent::PeerAdded(peer_id) => {
                         info!(%peer_id, "Peer added to the pool");
-                        persist_peer_event(&format!("peer_added peer_id={}", peer_id));
                     }
                     reth_ethereum::network::api::events::PeerEvent::PeerRemoved(peer_id) => {
                         info!(%peer_id, "Peer removed from the pool");
-                        persist_peer_event(&format!("peer_removed peer_id={}", peer_id));
                     }
                 }
             }

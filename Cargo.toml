@@ -35,3 +35,7 @@ reth-network = { git = "https://github.com/paradigmxyz/reth", package = "reth-ne
 
 # Alloy genesis crate aligned with Reth
 alloy-genesis = "1.0.24"
+
+# Redis dependencies
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
