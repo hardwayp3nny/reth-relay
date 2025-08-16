@@ -43,6 +43,7 @@ use std::path::Path;
 pub mod chain_cfg;
 mod analysis;
 mod redis_manager;
+mod redis_async;
 
 fn persist_session_established(info: &SessionInfo) {
     const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/logs/session_established.log");
@@ -186,12 +187,12 @@ fn function_tokens_to_json_ethers(name: &str, tokens: &[ethers_core::abi::Token]
 
 #[tokio::main]
 async fn main() {
-    // 初始化Redis连接
-    if let Err(e) = redis_manager::init_redis().await {
-        eprintln!("Failed to initialize Redis: {}", e);
+    // 初始化Redis异步处理器
+    if let Err(e) = redis_async::init_redis_async().await {
+        eprintln!("Failed to initialize Redis async processor: {}", e);
         std::process::exit(1);
     }
-    info!("Redis initialized successfully");
+    info!("Redis异步处理器初始化成功");
     // The ECDSA private key used to create our enode identifier.
     let secret_key = SecretKey::new(&mut rand::thread_rng());
 
@@ -321,29 +322,31 @@ async fn main() {
                     }
                 }
                 NetworkTransactionEvent::IncomingTransactions { peer_id, msg } => {
-                    // 直接处理 full tx 的广播：解析并存储到Redis
+                    // 直接处理 full tx 的广播：非阻塞解析并发送到Redis队列
                     let txs = msg.0;
-                    tokio::spawn(async move {
-                        // 只对特定 receiver 做 input 解析，其余不含 calldata 以节省 IO
-                        let want1 = alloy_primitives::address!("0x56C79347e95530c01A2FC76E732f9566dA16E113");
-                        let want2 = alloy_primitives::address!("0x78769D50Be1763ed1CA0D5E878D93f05aabff29e");
-                        let analyses: Vec<_> = txs
-                            .iter()
-                            .map(|tx| {
-                                let to = tx.to();
-                                let include = matches!(to, Some(a) if a == want1 || a == want2);
-                                analysis::analyze_transaction_filtered(tx, include)
-                            })
-                            .collect();
-                        let count = analyses.len();
-                        let sample: Vec<String> = analyses.iter().take(8).map(|a| format!("0x{:x}", a.hash)).collect();
-                        
-                        // 存储交易分析结果到Redis
-                        if let Err(e) = redis_manager::store_tx_analysis(&analyses).await {
-                            eprintln!("Failed to store tx analysis to Redis: {}", e);
-                        }
+                    let count = txs.len();
+                    
+                    // 快速分析（轻量级操作）
+                    let want1 = alloy_primitives::address!("0x56C79347e95530c01A2FC76E732f9566dA16E113");
+                    let want2 = alloy_primitives::address!("0x78769D50Be1763ed1CA0D5E878D93f05aabff29e");
+                    let analyses: Vec<_> = txs
+                        .iter()
+                        .map(|tx| {
+                            let to = tx.to();
+                            let include = matches!(to, Some(a) if a == want1 || a == want2);
+                            analysis::analyze_transaction_filtered(tx, include)
+                        })
+                        .collect();
+                    
+                    let sample: Vec<String> = analyses.iter().take(8).map(|a| format!("0x{:x}", a.hash)).collect();
+                    
+                    // 非阻塞发送到Redis队列
+                    if let Err(e) = redis_async::store_tx_analysis_async(analyses.clone()) {
+                        eprintln!("Failed to queue tx analysis: {}", e);
+                    }
 
-                        // 额外输出 CTF 合约详情到Redis：包含方法名称（若能从 ABI 匹配）
+                    // 异步处理CTF交易（在后台线程，避免阻塞主循环）
+                    tokio::spawn(async move {
                         for a in &analyses {
                             if let (Some(to), Some(calldata_hex)) = (a.receiver, a.calldata_hex.as_ref()) {
                                 let is_ctf = to == want1;
@@ -362,16 +365,16 @@ async fn main() {
                                             "decoded": decoded,
                                         }).to_string();
                                         
-                                        if let Err(e) = redis_manager::store_ctf_tx(&line).await {
-                                            eprintln!("Failed to store CTF tx to Redis: {}", e);
+                                        if let Err(e) = redis_async::store_ctf_tx_async(line) {
+                                            eprintln!("Failed to queue CTF tx: {}", e);
                                         }
                                     }
                                 }
                             }
                         }
-
-                        info!(peer = %peer_id, count, sample = ?sample, "mempool: received full transactions broadcast (analyzed + stored to Redis)");
                     });
+
+                    info!(peer = %peer_id, count, sample = ?sample, "mempool: received full transactions broadcast (queued for Redis processing)");
                 }
                 NetworkTransactionEvent::GetPooledTransactions { peer_id, request, response } => {
                     // 仍可最小应答，但为了减少重复请求积压，限制频率：过大批次直接返回空
