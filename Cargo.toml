@@ -5,6 +5,10 @@ publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[[bin]]
+name = "redis_listener_example"
+path = "redis_listener_example.rs"
+
 [dependencies]
 secp256k1 = { version = "0.30", features = ["rand", "global-context", "std", "recovery"] }
 tokio = { version = "1", features = ["full"] }
@@ -39,3 +43,13 @@ alloy-genesis = "1.0.24"
 # Redis dependencies
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# WebSocket dependencies
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tower = "0.4"
+tower-http = { version = "0.6", features = ["cors"] }
+axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
