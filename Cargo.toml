@@ -53,3 +53,8 @@ tower = "0.4"
 tower-http = { version = "0.6", features = ["cors"] }
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
+
+# 性能优化依赖
+futures = "0.3"
+dashmap = "6.0"
+parking_lot = "0.12"

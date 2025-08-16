@@ -14,12 +14,13 @@ const CTF_TX_PREFIX: &str = "ctf_tx:";
 pub const TX_ANALYSIS_CHANNEL: &str = "mempool:tx_analysis";
 pub const CTF_TX_CHANNEL: &str = "mempool:ctf_tx";
 
-// TTL设置为15秒
-const TTL_SECONDS: usize = 15;
+// TTL设置为60秒（避免数据过早过期）
+const TTL_SECONDS: usize = 60;
 
-// 批处理大小
-const BATCH_SIZE: usize = 50;
-const CHANNEL_BUFFER_SIZE: usize = 10000;
+// 极速批处理配置
+const BATCH_SIZE: usize = 100;  // 增加批次大小，提高吞吐量
+const CHANNEL_BUFFER_SIZE: usize = 20000;  // 增加缓冲区
+const FAST_BATCH_INTERVAL_MS: u64 = 15;  // 降低到15ms，提升实时性
 
 #[derive(Debug, Clone)]
 pub enum RedisOperation {
@@ -76,8 +77,8 @@ async fn redis_processor(
         processed_hashes: HashSet::new(),
     };
     
-    // 批处理定时器
-    let mut batch_timer = tokio::time::interval(tokio::time::Duration::from_millis(100));
+    // 极速批处理定时器（15ms间隔）
+    let mut batch_timer = tokio::time::interval(tokio::time::Duration::from_millis(FAST_BATCH_INTERVAL_MS));
     
     loop {
         tokio::select! {
@@ -106,8 +107,13 @@ async fn redis_processor(
                     }
                 }
                 
-                // 如果批次已满，立即处理
-                if batch.tx_analyses.len() >= BATCH_SIZE || batch.ctf_txs.len() >= BATCH_SIZE {
+                // 智能批处理：满批次或高频时立即处理
+                let should_process_immediately = 
+                    batch.tx_analyses.len() >= BATCH_SIZE || 
+                    batch.ctf_txs.len() >= BATCH_SIZE ||
+                    (batch.tx_analyses.len() + batch.ctf_txs.len() >= 20); // 高频模式：20个就处理
+                
+                if should_process_immediately {
                     if let Err(e) = process_batch(&conn, &mut batch).await {
                         eprintln!("❌ 批处理失败: {}", e);
                     }
@@ -208,14 +214,24 @@ async fn process_batch(
     
     let duration = start.elapsed();
     let total_items = batch.tx_analyses.len() + batch.ctf_txs.len();
+    let duration_us = duration.as_micros();
     
-    println!(
-        "📦 批处理完成: {} tx_analysis + {} ctf_tx = {} items, 耗时: {:?}",
-        batch.tx_analyses.len(),
-        batch.ctf_txs.len(),
-        total_items,
-        duration
-    );
+    // 性能统计（仅在有数据时输出）
+    if total_items > 0 {
+        println!(
+            "⚡ 极速批处理: {} tx + {} ctf = {} items, {}μs ({}k items/s)",
+            batch.tx_analyses.len(),
+            batch.ctf_txs.len(),
+            total_items,
+            duration_us,
+            if duration_us > 0 { (total_items as u128 * 1_000_000) / duration_us } else { 0 }
+        );
+        
+        // 性能告警
+        if duration_us > 50_000 {
+            eprintln!("⚠️ Redis批处理延迟过高: {}ms", duration_us / 1000);
+        }
+    }
     
     // 清空批次
     batch.tx_analyses.clear();
